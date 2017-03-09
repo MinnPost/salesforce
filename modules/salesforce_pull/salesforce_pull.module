@@ -86,7 +86,7 @@ function salesforce_pull() {
   $sfapi = salesforce_get_api();
   if ($sfapi->isAuthorized() && salesforce_pull_check_throttle()) {
     salesforce_pull_get_updated_records();
-    salesforce_pull_process_deleted_records();
+    salesforce_pull_get_deleted_records();
 
     // Store this request time for the throttle check.
     variable_set('salesforce_pull_last_sync', REQUEST_TIME);
@@ -103,10 +103,11 @@ function salesforce_pull() {
  */
 function salesforce_cron_queue_info() {
   $queues[SALESFORCE_PULL_QUEUE] = array(
-    'worker callback' => 'salesforce_pull_process_records',
+    'worker callback' => 'salesforce_pull_process_updated_records',
     // Set to a high max timeout in case pulling in lots of data from SF.
     'time' => 180,
   );
+
   return $queues;
 }
 
@@ -206,75 +207,21 @@ function salesforce_pull_get_updated_records() {
 
   $sfapi = salesforce_get_api();
   foreach (salesforce_mapping_get_mapped_objects() as $type) {
-    $mapped_fields = array();
-    $mapped_record_types = array();
 
-    // Iterate over each field mapping to determine our query parameters.
-    foreach (salesforce_mapping_load_multiple(array('salesforce_object_type' => $type)) as $mapping) {
-      foreach ($mapping->field_mappings as $field_map) {
-        // Exclude field mappings that are only drupal to SF.
-        if (in_array($field_map['direction'], array(
-          SALESFORCE_MAPPING_DIRECTION_SYNC,
-          SALESFORCE_MAPPING_DIRECTION_SF_DRUPAL
-        ))) {
-          // Some field map types (Relation) store a collection of SF objects.
-          if (is_array($field_map['salesforce_field']) && !isset($field_map['salesforce_field']['name'])) {
-            foreach ($field_map['salesforce_field'] as $sf_field) {
-              $mapped_fields[$sf_field['name']] = $sf_field['name'];
-            }
-          }
-          // The rest of are just a name/value pair.
-          else {
-            $mapped_fields[$field_map['salesforce_field']['name']] = $field_map['salesforce_field']['name'];
-          }
-        }
-      }
-
-      if (!empty($mapped_fields) && $mapping->salesforce_record_type_default != SALESFORCE_MAPPING_DEFAULT_RECORD_TYPE) {
-        foreach ($mapping->salesforce_record_types_allowed as $record_type) {
-          if ($record_type) {
-            $mapped_record_types[$record_type] = $record_type;
-          }
-        }
-        // Add the RecordTypeId field so we can use it when processing the
-        // queued SF objects.
-        $mapped_fields['RecordTypeId'] = 'RecordTypeId';
-      }
-    }
-
-    // There are no field mappings configured to pull data from Salesforce so
-    // move on to the next mapped object. Prevents querying unmapped data.
-    if (empty($mapped_fields)) {
+    $soql = salesforce_pull_get_pull_query($type);
+    if (empty($soql)) {
       continue;
     }
-
-    $soql = new SalesforceSelectQuery($type);
-    // Convert field mappings to SOQL.
-    $soql->fields = array_merge($mapped_fields, array(
-      'Id' => 'Id',
-      $mapping->pull_trigger_date => $mapping->pull_trigger_date
-    ));
-
-    // If no lastupdate, get all records, else get records since last pull.
-    $sf_last_sync = variable_get('salesforce_pull_last_sync_' . $type, NULL);
-    if ($sf_last_sync) {
-      $last_sync = gmdate('Y-m-d\TH:i:s\Z', $sf_last_sync);
-      $soql->addCondition($mapping->pull_trigger_date, $last_sync, '>');
-    }
-
-    // If Record Type is specified, restrict query.
-    if (count($mapped_record_types) > 0) {
-      $soql->addCondition('RecordTypeId', $mapped_record_types, 'IN');
-    }
-
-    // Execute query.
+    
     $results = $sfapi->query($soql);
+
     $version_path = parse_url($sfapi->getApiEndPoint(), PHP_URL_PATH);
 
     if (!isset($results['errorCode'])) {
       // Write items to the queue.
       foreach ($results['records'] as $result) {
-        $queue->createItem($result);
+        $queue_item = array('update' => $result);
+        $queue->createItem($queue_item);
       }
 
       // Handle requests larger than the batch limit (usually 2000).
@@ -286,7 +233,8 @@ function salesforce_pull_get_updated_records() {
         if (!isset($new_result['errorCode'])) {
           // Write items to the queue.
           foreach ($new_result['records'] as $result) {
-            $queue->createItem($result);
+            $queue_item = array('update' => $result);
+            $queue->createItem($queue_item);
           }
         }
         $next_records_url = isset($new_result['nextRecordsUrl']) ?
@@ -302,224 +250,284 @@ function salesforce_pull_get_updated_records() {
 }
 
 /**
- * Process records in the queue.
+ * Given a SObject type name, build an SOQL query to include all fields for all
+ * SalesforceMappings mapped to that SObject.
+ *
+ * @param string $type
+ *   e.g. "Contact", "Account", etc.
+ *
+ * @return SalesforceSelectQuery or NULL if no mappings or no mapped fields
+ *   were found.
+ *
+ * @see SalesforceMapping::getMappedFields
+ * @see SalesforceMapping::getMappedRecordTypes
  */
-function salesforce_pull_process_records($sf_object) {
-  // Get Mapping.
-  $mapping_conditions = array(
-    'salesforce_object_type' => $sf_object['attributes']['type'],
-  );
-  if (isset($sf_object['RecordTypeId']) && $sf_object['RecordTypeId'] != SALESFORCE_MAPPING_DEFAULT_RECORD_TYPE) {
-    $mapping_conditions['salesforce_record_type'] = $sf_object['RecordTypeId'];
+function salesforce_pull_get_pull_query($type) {
+  $mapped_fields = array();
+  $mapped_record_types = array();
+
+  // Iterate over each field mapping to determine our query parameters.
+  foreach (salesforce_mapping_load_multiple(array('salesforce_object_type' => $type)) as $mapping) {
+    $mapped_fields = array_merge($mapped_fields, $mapping->getMappedFields(array(SALESFORCE_MAPPING_DIRECTION_SYNC, SALESFORCE_MAPPING_DIRECTION_SF_DRUPAL)));
   }
 
-  $sf_mappings = salesforce_mapping_load_multiple($mapping_conditions);
-
-  $hold_exceptions = count($sf_mappings) > 1;
-  $exception = FALSE;
-  foreach ($sf_mappings as $sf_mapping) {
-    // Mapping object exists?
-    $mapping_object = salesforce_mapping_object_load_by_sfid($sf_object['Id']);
-    // Allow other modules to define or alter the mapping object.
-    drupal_alter('salesforce_pull_mapping_object', $mapping_object, $sf_object, $sf_mapping);
-    $exists = $mapping_object ? TRUE : FALSE;
-    if ($exists && ($sf_mapping->sync_triggers & SALESFORCE_MAPPING_SYNC_SF_UPDATE)) {
-      try {
-        $entity = entity_load_single($mapping_object->entity_type, $mapping_object->entity_id);
-        if ($entity === FALSE) {
-          $exists = FALSE;
-          $message = t('Unable to update %type entity %label from Salesforce object %sfobjectid. Entity does not exist. Mapping removed, continuing with Create instead Update.',
-            array(
-              '%type' => $mapping_object->entity_type,
-              '%label' => $mapping_object->entity_id,
-              '%sfobjectid' => $sf_object['Id'],
-            ));
-          watchdog('Salesforce Pull', $message, array(), WATCHDOG_NOTICE);
-          salesforce_set_message($message, 'status', FALSE);
-          entity_delete('salesforce_mapping_object', $mapping_object->salesforce_mapping_object_id);
-        }
-        else {
-          // Flag this entity as having been processed. This does not persist,
-          // but is used by salesforce_push to avoid duplicate processing.
-          $entity->salesforce_pull = TRUE;
-          $entity_updated = isset($entity->updated) ? $entity->updated : $mapping_object->entity_updated;
-
-          $sf_object_updated = strtotime($sf_object[$sf_mapping->pull_trigger_date]);
-          if ($sf_object_updated > $entity_updated) {
-            $wrapper = entity_metadata_wrapper($sf_mapping->drupal_entity_type, $entity);
-
-            // Set fields values on the Drupal entity.
-            salesforce_pull_map_fields($sf_mapping->field_mappings, $wrapper, $sf_object);
-
-            // Allow modules to react just prior to entity save.
-            module_invoke_all('salesforce_pull_entity_presave', $wrapper->value(), $sf_object, $sf_mapping);
-
-            // Update entity.
-            $wrapper->save();
-
-            // Allow modules to react to entity update.
-            module_invoke_all('salesforce_pull_entity_update', $wrapper->value(), $sf_object, $sf_mapping);
-
-            // Update mapping object.
-            $mapping_object->last_sync_message = t('Retrieved updates from Salesforce');
-            $mapping_object->last_sync_status = SALESFORCE_MAPPING_STATUS_SUCCESS;
-            $mapping_object->entity_updated = $mapping_object->last_sync = time();
-            watchdog('Salesforce Pull',
-              'Updated entity %label associated with Salesforce Object ID: %sfid',
-              array(
-                '%label' => $wrapper->label(),
-                '%sfid' => $sf_object['Id'],
-              )
-            );
-          }
-        }
-      } catch (Exception $e) {
-        $message = t('Failed to update entity %label %id from Salesforce object %sfobjectid. Error: @msg',
-          array(
-            '%label' => $mapping_object->entity_type,
-            '%id' => $mapping_object->entity_id,
-            '%sfobjectid' => $sf_object['Id'],
-            '@msg' => $e->getMessage(),
-          )
-        );
-        watchdog('Salesforce Pull', $message, array(), WATCHDOG_ERROR);
-        salesforce_set_message($message, 'error', FALSE);
-        $mapping_object->last_sync_status = SALESFORCE_MAPPING_STATUS_ERROR;
-        $mapping_object->last_sync_message = t('Processing failed');
-        $mapping_object->last_sync = time();
-        if (!$hold_exceptions) {
-          throw $e;
-        }
-        if (empty($exception)) {
-          $exception = $e;
-        }
-        else {
-          $my_class = get_class($e);
-          $exception = new $my_class($e->getMessage(), $e->getCode(), $exception);
-        }
-      }
-    }
-    else {
-      $exists = FALSE;
-    }
-    if (!$exists && $sf_mapping->sync_triggers & SALESFORCE_MAPPING_SYNC_SF_CREATE) {
-      try {
-        // Create entity from mapping object and field maps.
-        $entity_info = entity_get_info($sf_mapping->drupal_entity_type);
-
-        // Define values to pass to entity_create().
-        $values = array();
-        if (isset($entity_info['entity keys']['bundle']) &&
-          !empty($entity_info['entity keys']['bundle'])
-        ) {
-          $values[$entity_info['entity keys']['bundle']] = $sf_mapping->drupal_bundle;
-
-          // Because creating term via entities actually needs vid and won't be
-          // fixed in Entity API (https://www.drupal.org/node/1409256).
-          if (isset($values['vocabulary_machine_name'])) {
-            $vocabulary = taxonomy_vocabulary_machine_name_load($values['vocabulary_machine_name']);
-            $values['vid'] = $vocabulary->vid;
-          }
-        }
-        else {
-          // Not all entities will have bundle defined under entity keys,
-          // e.g. the User entity.
-          $values[$sf_mapping->drupal_bundle] = $sf_mapping->drupal_bundle;
-        }
-
-        // See note above about flag.
-        $values['salesforce_pull'] = TRUE;
-
-        // Create entity.
-        $entity = entity_create($sf_mapping->drupal_entity_type, $values);
-
-        // Flag this entity as having been processed. This does not persist,
-        // but is used by salesforce_push to avoid duplicate processing.
-        $entity->salesforce_pull = TRUE;
-        $wrapper = entity_metadata_wrapper($sf_mapping->drupal_entity_type, $entity);
-
-        salesforce_pull_map_fields($sf_mapping->field_mappings, $wrapper, $sf_object);
-
-        // Allow modules to react just prior to entity save.
-        module_invoke_all('salesforce_pull_entity_presave', $wrapper->value(), $sf_object, $sf_mapping);
-
-        $wrapper->save();
-
-        // Allow modules to react to entity creation.
-        module_invoke_all('salesforce_pull_entity_insert', $wrapper->value(), $sf_object, $sf_mapping);
-
-        // Update mapping object.
-        $last_sync_message = t('Retrieved new record from Salesforce');
-        $last_sync_status = SALESFORCE_MAPPING_STATUS_SUCCESS;
-        $entity_updated = time();
-      } catch (Exception $e) {
-        $message = $e->getMessage() . ' ' . t('Processing failed for entity %label associated with Salesforce Object ID: %sfobjectid',
-            array(
-              '%label' => $wrapper->label(),
-              '%sfobjectid' => $sf_object['Id'],
-            )
-          );
-        watchdog('Salesforce Pull', $message, array(), WATCHDOG_ERROR);
-        salesforce_set_message(t('There were failures processing data from Salesforce. Please check the error logs.'), 'error', FALSE);
-        $last_sync_status = SALESFORCE_MAPPING_STATUS_ERROR;
-        $last_sync_message = t('Processing failed for new record');
-        $entity_updated = NULL;
-        if (!$hold_exceptions) {
-          throw $e;
-        }
-        if (empty($exception)) {
-          $exception = $e;
-        }
-        else {
-          $my_class = get_class($e);
-          $exception = new $my_class($e->getMessage(), $e->getCode(), $exception);
-        }
-      }
-
-      // If no id exists, the insert failed and we cannot create a mapping
-      // object. We are left with no choice but to throw an exception.
-      list($entity_id) = entity_extract_ids($sf_mapping->drupal_entity_type, $entity);
-      if (!$entity_id) {
-        $sf_object_id = $sf_object['Id'];
-        throw new Exception("Failed to create Drupal entity when processing data from Salesforce object: $sf_object_id.");
-      }
-
-      // Create mapping object.
-      $mapping_object = entity_create('salesforce_mapping_object', array(
-        'salesforce_id' => $sf_object['Id'],
-        'entity_type' => $sf_mapping->drupal_entity_type,
-        'entity_id' => $entity_id,
-        'entity_updated' => $entity_updated,
-        'last_sync' => time(),
-        'last_sync_message' => $last_sync_message,
-        'last_sync_status' => $last_sync_status,
-      ));
-
-      watchdog('Salesforce Pull',
-        'Created entity %label associated with Salesforce Object ID: %sfid',
-        array(
-          '%label' => $wrapper->label(),
-          '%sfid' => $sf_object['Id'],
-        )
-      );
-
-    }
-
-    // Save our mapped objects.
-    if ($mapping_object) {
-      $mapping_object->last_sync_action = 'pull';
-      $mapping_object->save();
-    }
+  // There are no field mappings configured to pull data from Salesforce so
+  // move on to the next mapped object. Prevents querying unmapped data.
+  if (empty($mapped_fields)) {
+    return NULL;
   }
-  if (!empty($exception)) {
-    throw $exception;
+
+  $soql = new SalesforceSelectQuery($type);
+  // Convert field mappings to SOQL.
+  $soql->fields = array_merge($mapped_fields, array(
+    'Id' => 'Id',
+    $mapping->pull_trigger_date => $mapping->pull_trigger_date
+  ));
+
+  // If no lastupdate, get all records, else get records since last pull.
+  $sf_last_sync = variable_get('salesforce_pull_last_sync_' . $type, NULL);
+  if ($sf_last_sync) {
+    $last_sync = gmdate('Y-m-d\TH:i:s\Z', $sf_last_sync);
+    $soql->addCondition($mapping->pull_trigger_date, $last_sync, '>');
   }
+
+  // If Record Type is specified, restrict query.
+  $mapped_record_types = $mapping->getMappedRecordTypes();
+  if (count($mapped_record_types) > 0) {
+    $soql->addCondition('RecordTypeId', $mapped_record_types, 'IN');
+  }
+
+  return $soql;
 }
 
 /**
- * Process deleted records from salesforce.
+ * Process records in the queue.
  */
-function salesforce_pull_process_deleted_records() {
+function salesforce_pull_process_updated_records($sf_object) {
+  if (isset($sf_object['delete'])) {
+    salesforce_pull_process_deleted_records($sf_object['delete']);
+  }
+  else if (isset($sf_object['merge'])) {
+    salesforce_pull_process_merged_records($sf_object['merge']);
+  }
+  else {
+    $sf_object = $sf_object['update'];
+
+    // Get Mapping.
+    $mapping_conditions = array(
+      'salesforce_object_type' => $sf_object['attributes']['type'],
+    );
+    if (isset($sf_object['RecordTypeId']) && $sf_object['RecordTypeId'] != SALESFORCE_MAPPING_DEFAULT_RECORD_TYPE) {
+      $mapping_conditions['salesforce_record_type'] = $sf_object['RecordTypeId'];
+    }
+
+    $sf_mappings = salesforce_mapping_load_multiple($mapping_conditions);
+
+    $hold_exceptions = count($sf_mappings) > 1;
+    $exception = FALSE;
+    foreach ($sf_mappings as $sf_mapping) {
+      // Mapping object exists?
+      $mapping_object = salesforce_mapping_object_load_by_sfid($sf_object['Id']);
+      // Allow other modules to define or alter the mapping object.
+      drupal_alter('salesforce_pull_mapping_object', $mapping_object, $sf_object, $sf_mapping);
+      $exists = $mapping_object ? TRUE : FALSE;
+      if ($exists && ($sf_mapping->sync_triggers & SALESFORCE_MAPPING_SYNC_SF_UPDATE)) {
+        try {
+          $entity = entity_load_single($mapping_object->entity_type, $mapping_object->entity_id);
+          if ($entity === FALSE) {
+            $exists = FALSE;
+            $message = t('Unable to update %type entity %label from Salesforce object %sfobjectid. Entity does not exist. Mapping removed, continuing with Create instead Update.',
+              array(
+                '%type' => $mapping_object->entity_type,
+                '%label' => $mapping_object->entity_id,
+                '%sfobjectid' => $sf_object['Id'],
+              ));
+            watchdog('Salesforce Pull', $message, array(), WATCHDOG_NOTICE);
+            salesforce_set_message($message, 'status', FALSE);
+            entity_delete('salesforce_mapping_object', $mapping_object->salesforce_mapping_object_id);
+          }
+          else {
+            // Flag this entity as having been processed. This does not persist,
+            // but is used by salesforce_push to avoid duplicate processing.
+            $entity->salesforce_pull = TRUE;
+            $entity_updated = isset($entity->updated) ? $entity->updated : $mapping_object->entity_updated;
+
+            $sf_object_updated = strtotime($sf_object[$sf_mapping->pull_trigger_date]);
+            if ($sf_object_updated > $entity_updated) {
+              $wrapper = entity_metadata_wrapper($sf_mapping->drupal_entity_type, $entity);
+
+              // Set fields values on the Drupal entity.
+              salesforce_pull_map_fields($sf_mapping->field_mappings, $wrapper, $sf_object);
+
+              // Allow modules to react just prior to entity save.
+              module_invoke_all('salesforce_pull_entity_presave', $wrapper->value(), $sf_object, $sf_mapping);
+
+              // Update entity.
+              $wrapper->save();
+
+              // Allow modules to react to entity update.
+              module_invoke_all('salesforce_pull_entity_update', $wrapper->value(), $sf_object, $sf_mapping);
+
+              // Update mapping object.
+              $mapping_object->last_sync_message = t('Retrieved updates from Salesforce');
+              $mapping_object->last_sync_status = SALESFORCE_MAPPING_STATUS_SUCCESS;
+              $mapping_object->entity_updated = $mapping_object->last_sync = time();
+              watchdog('Salesforce Pull',
+                'Updated entity %label associated with Salesforce Object ID: %sfid',
+                array(
+                  '%label' => $wrapper->label(),
+                  '%sfid' => $sf_object['Id'],
+                )
+              );
+            }
+          }
+        } catch (Exception $e) {
+          $message = t('Failed to update entity %label %id from Salesforce object %sfobjectid. Error: @msg',
+            array(
+              '%label' => $mapping_object->entity_type,
+              '%id' => $mapping_object->entity_id,
+              '%sfobjectid' => $sf_object['Id'],
+              '@msg' => $e->getMessage(),
+            )
+          );
+          watchdog('Salesforce Pull', $message, array(), WATCHDOG_ERROR);
+          salesforce_set_message($message, 'error', FALSE);
+          $mapping_object->last_sync_status = SALESFORCE_MAPPING_STATUS_ERROR;
+          $mapping_object->last_sync_message = t('Processing failed');
+          $mapping_object->last_sync = time();
+          if (!$hold_exceptions) {
+            throw $e;
+          }
+          if (empty($exception)) {
+            $exception = $e;
+          }
+          else {
+            $my_class = get_class($e);
+            $exception = new $my_class($e->getMessage(), $e->getCode(), $exception);
+          }
+        }
+      }
+      else {
+        $exists = FALSE;
+      }
+      if (!$exists && $sf_mapping->sync_triggers & SALESFORCE_MAPPING_SYNC_SF_CREATE) {
+        try {
+          // Create entity from mapping object and field maps.
+          $entity_info = entity_get_info($sf_mapping->drupal_entity_type);
+
+          // Define values to pass to entity_create().
+          $values = array();
+          if (isset($entity_info['entity keys']['bundle']) &&
+            !empty($entity_info['entity keys']['bundle'])
+          ) {
+            $values[$entity_info['entity keys']['bundle']] = $sf_mapping->drupal_bundle;
+
+            // Because creating term via entities actually needs vid and won't be
+            // fixed in Entity API (https://www.drupal.org/node/1409256).
+            if (isset($values['vocabulary_machine_name'])) {
+              $vocabulary = taxonomy_vocabulary_machine_name_load($values['vocabulary_machine_name']);
+              $values['vid'] = $vocabulary->vid;
+            }
+          }
+          else {
+            // Not all entities will have bundle defined under entity keys,
+            // e.g. the User entity.
+            $values[$sf_mapping->drupal_bundle] = $sf_mapping->drupal_bundle;
+          }
+
+          // See note above about flag.
+          $values['salesforce_pull'] = TRUE;
+
+          // Create entity.
+          $entity = entity_create($sf_mapping->drupal_entity_type, $values);
+
+          // Flag this entity as having been processed. This does not persist,
+          // but is used by salesforce_push to avoid duplicate processing.
+          $entity->salesforce_pull = TRUE;
+          $wrapper = entity_metadata_wrapper($sf_mapping->drupal_entity_type, $entity);
+
+          salesforce_pull_map_fields($sf_mapping->field_mappings, $wrapper, $sf_object);
+
+          // Allow modules to react just prior to entity save.
+          module_invoke_all('salesforce_pull_entity_presave', $wrapper->value(), $sf_object, $sf_mapping);
+
+          $wrapper->save();
+
+          // Allow modules to react to entity creation.
+          module_invoke_all('salesforce_pull_entity_insert', $wrapper->value(), $sf_object, $sf_mapping);
+
+          // Update mapping object.
+          $last_sync_message = t('Retrieved new record from Salesforce');
+          $last_sync_status = SALESFORCE_MAPPING_STATUS_SUCCESS;
+          $entity_updated = time();
+        } catch (Exception $e) {
+          $message = $e->getMessage() . ' ' . t('Processing failed for entity %label associated with Salesforce Object ID: %sfobjectid',
+              array(
+                '%label' => $wrapper->label(),
+                '%sfobjectid' => $sf_object['Id'],
+              )
+            );
+          watchdog('Salesforce Pull', $message, array(), WATCHDOG_ERROR);
+          salesforce_set_message(t('There were failures processing data from Salesforce. Please check the error logs.'), 'error', FALSE);
+          $last_sync_status = SALESFORCE_MAPPING_STATUS_ERROR;
+          $last_sync_message = t('Processing failed for new record');
+          $entity_updated = NULL;
+          if (!$hold_exceptions) {
+            throw $e;
+          }
+          if (empty($exception)) {
+            $exception = $e;
+          }
+          else {
+            $my_class = get_class($e);
+            $exception = new $my_class($e->getMessage(), $e->getCode(), $exception);
+          }
+        }
+
+        // If no id exists, the insert failed and we cannot create a mapping
+        // object. We are left with no choice but to throw an exception.
+        list($entity_id) = entity_extract_ids($sf_mapping->drupal_entity_type, $entity);
+        if (!$entity_id) {
+          $sf_object_id = $sf_object['Id'];
+          throw new Exception("Failed to create Drupal entity when processing data from Salesforce object: $sf_object_id.");
+        }
+
+        // Create mapping object.
+        $mapping_object = entity_create('salesforce_mapping_object', array(
+          'salesforce_id' => $sf_object['Id'],
+          'entity_type' => $sf_mapping->drupal_entity_type,
+          'entity_id' => $entity_id,
+          'entity_updated' => $entity_updated,
+          'last_sync' => time(),
+          'last_sync_message' => $last_sync_message,
+          'last_sync_status' => $last_sync_status,
+        ));
+
+        watchdog('Salesforce Pull',
+          'Created entity %label associated with Salesforce Object ID: %sfid',
+          array(
+            '%label' => $wrapper->label(),
+            '%sfid' => $sf_object['Id'],
+          )
+        );
+
+      }
+
+      // Save our mapped objects.
+      if ($mapping_object) {
+        $mapping_object->last_sync_action = 'pull';
+        $mapping_object->save();
+      }
+    }
+    if (!empty($exception)) {
+      throw $exception;
+    }
+  }
+}
+/**
+ * Get deleted records from salesforce.
+ */
+function salesforce_pull_get_deleted_records() {
   // Calculate which client to use. We default to the REST client but also
   // support SOAP if enabled. Note that deletions can only be queried via REST
   // with an API version >= 29.0.
@@ -529,11 +537,15 @@ function salesforce_pull_process_deleted_records() {
     $client = new SalesforceSoapPartner($sfapi, variable_get('salesforce_partner_wsdl', libraries_get_path('salesforce') . '/soapclient/partner.wsdl.xml'));
   }
 
+  // Before we delete any records, we must check for merged records.
+  $merged_results = salesforce_pull_check_merged_records();
+
   // Load all unique SF record types that we have mappings for.
   foreach (array_reverse(salesforce_mapping_get_mapped_objects()) as $type) {
     $last_delete_sync = variable_get('salesforce_pull_delete_last_' . $type, REQUEST_TIME);
     variable_set('salesforce_pull_delete_last_' . $type, REQUEST_TIME);
-
+    $version_path = parse_url($sfapi->getApiEndPoint(), PHP_URL_PATH);
+    $queue = DrupalQueue::get(SALESFORCE_PULL_QUEUE);
     $now = time();
 
     // getDeleted() constraint: startDate cannot be more than 30 days ago
@@ -549,66 +561,221 @@ function salesforce_pull_process_deleted_records() {
     // SOAP getDeleted() returns an object while the REST getDeleted() returns
     // an array, so cast all checked values to an object to avoid additional
     // conditional logic.
-    $deleted = (object) $client->getDeleted($type, $last_delete_sync_sf, $now_sf);
-    if (empty($deleted->deletedRecords)) {
+    $results = (object) $client->getDeleted($type, $last_delete_sync_sf, $now_sf);
+    if (empty($results->deletedRecords)) {
       continue;
     }
-    foreach ($deleted->deletedRecords as $record) {
-      $record = (object) $record;
-      $mapping_object = salesforce_mapping_object_load_by_sfid($record->id);
-      if (!$mapping_object) {
-        continue;
-      }
+    if (!isset($results->errorCode)) {
 
-      // Load and wrap the Drupal entity linked to the SF object.
-      $entity = entity_load_single($mapping_object->entity_type, $mapping_object->entity_id);
+      // Handle merges from Salesforce.
+      $merge_fields = array(
+        'old_contact' => 'Old_Contact__c',
+        'merged_entity' => 'Contact__c',
+      );
 
-      // Check if entity exists before processing delete.
-      if ($entity) {
-        $entity_wrapper = entity_metadata_wrapper($mapping_object->entity_type, $entity);
-
-        // Load the mapping that manages these mapped objects.
-        $sf_mapping = reset(salesforce_mapping_load_multiple(
-          array(
-            'salesforce_object_type' => $type,
-            'drupal_entity_type' => $entity_wrapper->type(),
-            'drupal_bundle' => $entity_wrapper->getBundle(),
-          )
-        ));
-
-        // Only delete the mapped Drupal entity if the
-        // SALESFORCE_MAPPING_SYNC_SF_DELETE flag is set.
-        if (!empty($sf_mapping) && ($sf_mapping->sync_triggers & SALESFORCE_MAPPING_SYNC_SF_DELETE)) {
-          // Prevent processing by salesforce_push. We hate circular logic.
-          $entity->salesforce_pull = TRUE;
-
-          // Delete the mapped Drupal entity. Catch any exceptions as
-          // we want to ensure the mapping object is deleted even in
-          // case of an error.
-          try {
-            $entity_wrapper->delete();
+      drupal_alter('salesforce_pull_entity_merge_fields', $merge_fields);
+      foreach ($results->deletedRecords as $result) {
+        foreach ($merged_results['records'] as $merged_result) {
+          if ($result->id == $merged_result[$merge_fields['old_contact']]) {
+            $queue_item = array('merge' => $merged_result);
+            $queue->createItem($queue_item);
           }
-          catch (Exception $e) {
-            watchdog_exception('salesforce_pull', $e);
-          }
-
-          watchdog('Salesforce Pull',
-            'Deleted entity %label with ID: %id associated with Salesforce Object ID: %sfid',
-            array(
-              '%label' => $entity_wrapper->label(),
-              '%id' => $mapping_object->entity_id,
-              '%sfid' => $record->id,
-            )
-          );
         }
       }
 
-      // Delete mapping object.
-      $mapping_object->delete();
+      // Write items to the queue.
+      foreach ($results->deletedRecords as $result) {
+        $queue_item = array('delete' => $result);
+        $queue->createItem($queue_item);
+      }
+
+      // Handle requests larger than the batch limit (usually 2000).
+      $next_records_url = isset($results->nextRecordsUrl) ?
+        str_replace($version_path, '', $results->nextRecordsUrl) :
+        FALSE;
+      while ($next_records_url) {
+        $new_result = $sfapi->apiCall($next_records_url);
+        if (!isset($new_result['errorCode'])) {
+          foreach ($results->deletedRecords as $result) {
+            foreach ($merged_results['records'] as $merged_result) {
+              if ($result->id == $merged_result[$merge_fields['old_contact']]) {
+                $queue_item = array('merge' => $merged_result);
+                $queue->createItem($queue_item);
+              }
+            }
+          }
+
+          // Write items to the queue.
+          foreach ($new_result['records'] as $result) {
+            $queue_item = array('delete' => $result);
+            $queue->createItem($queue_item);
+          }
+        }
+        $next_records_url = isset($new_result->nextRecordsUrl) ?
+          str_replace($version_path, '', $new_result->nextRecordsUrl) : FALSE;
+      }
+
+      variable_set('salesforce_pull_last_sync_' . $type, REQUEST_TIME);
     }
+
   }
 }
 
+/**
+ * Process merged records from salesforce.
+ */
+function salesforce_pull_process_merged_records($sf_object) {
+  // Handle merges from Salesforce.
+  $merge_fields = array(
+    'old_contact_key' => 'Old_Contact__c',
+    'merged_contact_key' => 'Contact__c',
+  );
+
+  drupal_alter('salesforce_pull_entity_merge_fields', $merge_fields);
+
+  $entity_to_delete = salesforce_mapping_object_load_by_sfid($sf_object[$merge_fields['old_contact_key']]);
+  $merged_entity = salesforce_mapping_object_load_by_sfid($sf_object[$merge_fields['merged_contact_key']]);
+
+  // Load and wrap the Drupal entity linked to the SF object.
+  if ($entity_to_delete && $merged_entity) {
+    $wrapper = entity_metadata_wrapper($entity_to_delete->entity_type, $entity_to_delete);
+
+    // Prevent processing by salesforce_push. We hate circular logic.
+    $merged_entity->salesforce_pull = TRUE;
+
+    // Delete the mapped Drupal entity. Catch any exceptions as
+    // we want to ensure the mapping object is deleted even in
+    // case of an error.
+    module_invoke_all('salesforce_pull_entity_merge', $entity_to_delete, $merged_entity);
+
+    watchdog('Salesforce Pull',
+      'Merged entity %label with ID: %id associated with Salesforce Object ID: %sfid to %label with ID: %newid associated with Salesforce Object ID: %newsfid',
+      array(
+        '%label' => $wrapper->label(),
+        '%id' => $entity_to_delete->entity_id,
+        '%sfid' => $sf_object[$merge_fields['old_contact_key']],
+        '%newid' => $merged_entity->entity_id,
+        '%newsfid' => $sf_object[$merge_fields['merged_contact_key']]
+      )
+    );
+  }
+}
+/**
+ * Process deleted records from salesforce.
+ */
+function salesforce_pull_process_deleted_records($sf_object) {
+  $mapping_object = salesforce_mapping_object_load_by_sfid($sf_object->id);
+
+  // Load and wrap the Drupal entity linked to the SF object.
+  if ($mapping_object) {
+    $deleted_entity = entity_load_single($mapping_object->entity_type, $mapping_object->entity_id);
+
+    // Check if entity exists before processing delete.
+    if ($deleted_entity) {
+      $wrapper = entity_metadata_wrapper($mapping_object->entity_type, $deleted_entity);
+
+      // Load the mapping that manages these mapped objects.
+      $sf_mapping = reset(salesforce_mapping_load_multiple(
+        array(
+          'salesforce_object_type' => $sf_object['attributes']['type'],
+          'drupal_entity_type' => $wrapper->type(),
+          'drupal_bundle' => $wrapper->getBundle(),
+        )
+      ));
+
+      // Only delete the mapped Drupal entity if the
+      // SALESFORCE_MAPPING_SYNC_SF_DELETE flag is set.
+      if (!empty($sf_mapping) && ($sf_mapping->sync_triggers & SALESFORCE_MAPPING_SYNC_SF_DELETE)) {
+        // Prevent processing by salesforce_push. We hate circular logic.
+        $deleted_entity->salesforce_pull = TRUE;
+
+        // Delete the mapped Drupal entity. Catch any exceptions as
+        // we want to ensure the mapping object is deleted even in
+        // case of an error.
+        try {
+          $wrapper->delete();
+        }
+        catch (Exception $e) {
+          watchdog_exception('salesforce_pull', $e);
+        }
+
+        watchdog('Salesforce Pull',
+          'Deleted entity %label with ID: %id associated with Salesforce Object ID: %sfid',
+          array(
+            '%label' => $wrapper->label(),
+            '%id' => $mapping_object->entity_id,
+            '%sfid' => $sf_object->id,
+          )
+        );
+      }
+    }
+
+    // Delete mapping object.
+    $mapping_object->delete();
+  }
+}
+
+/**
+ * Get all the merged records since the last delete.
+ */
+function salesforce_pull_check_merged_records() {
+  $merge_fields = array(
+    'type' => 'Merged_Contact__c',
+    'merged_contact' => 'Contact__c',
+    'old_contact' => 'Old_Contact__c',
+    'modified_date' => 'LastModifiedDate',
+  );
+
+  drupal_alter('salesforce_pull_entity_merge_fields', $merge_fields);
+
+  $last_delete_sync = variable_get('salesforce_pull_delete_last_' . $merge_fields['type'], REQUEST_TIME);
+
+  $sfapi = salesforce_get_api();
+
+  $soql = new SalesforceSelectQuery($merge_fields['type']);
+
+  // Convert field mappings to SOQL.
+  $soql->fields = array(
+    'Id' => 'Id',
+    $merge_fields['merged_contact'] => $merge_fields['merged_contact'],
+    $merge_fields['old_contact'] => $merge_fields['old_contact'],
+    $merge_fields['modified_date'] => $merge_fields['modified_date'],
+  );
+
+  // If no lastupdate, get all records, else get records since last pull.
+  $sf_last_sync = variable_get('salesforce_pull_last_sync_' . $merge_fields['type'], NULL);
+  if ($sf_last_sync) {
+    $last_sync = gmdate('Y-m-d\TH:i:s\Z', $sf_last_sync);
+    $soql->addCondition($last_delete_sync, $last_sync, '>');
+  }
+
+  // Execute query.
+  $results = $sfapi->query($soql);
+  $version_path = parse_url($sfapi->getApiEndPoint(), PHP_URL_PATH);
+
+  if (!isset($results['errorCode'])) {
+    $merged_records = $results;
+
+    // Handle requests larger than the batch limit (usually 2000).
+    $next_records_url = isset($results['nextRecordsUrl']) ?
+      str_replace($version_path, '', $results['nextRecordsUrl']) :
+      FALSE;
+    while ($next_records_url) {
+      $new_result = $sfapi->apiCall($next_records_url);
+      if (!isset($new_result['errorCode'])) {
+
+        // Write items to the queue.
+        foreach ($new_result['records'] as $result) {
+          $merged_records[] = $result;
+        }
+      }
+      $next_records_url = isset($new_result['nextRecordsUrl']) ?
+        str_replace($version_path, '', $new_result['nextRecordsUrl']) : FALSE;
+    }
+
+    return $merged_records;
+  }
+}
 /**
  * Map field values.
  *
