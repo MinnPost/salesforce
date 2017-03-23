@@ -212,7 +212,7 @@ function salesforce_pull_get_updated_records() {
     if (empty($soql)) {
       continue;
     }
-    
+
     $results = $sfapi->query($soql);
 
     $version_path = parse_url($sfapi->getApiEndPoint(), PHP_URL_PATH);
@@ -533,8 +533,10 @@ function salesforce_pull_get_deleted_records() {
   // with an API version >= 29.0.
   $sfapi = salesforce_get_api();
   $client = $sfapi;
+  $use_soap = FALSE;
   if (class_exists('SalesforceSoapPartner')) {
     $client = new SalesforceSoapPartner($sfapi, variable_get('salesforce_partner_wsdl', libraries_get_path('salesforce') . '/soapclient/partner.wsdl.xml'));
+    $use_soap = TRUE;
   }
 
   // Before we delete any records, we must check for merged records.
@@ -561,11 +563,20 @@ function salesforce_pull_get_deleted_records() {
     // SOAP getDeleted() returns an object while the REST getDeleted() returns
     // an array, so cast all checked values to an object to avoid additional
     // conditional logic.
-    $results = (object) $client->getDeleted($type, $last_delete_sync_sf, $now_sf);
+    if ($use_soap) {
+      $results = (object) $client->trySoap('getDeleted', $type, $last_delete_sync_sf, $now_sf);
+    }
+    else {
+      $results = (object) $client->getDeleted($type, $last_delete_sync_sf, $now_sf);
+    }
     if (empty($results->deletedRecords)) {
       continue;
     }
     if (!isset($results->errorCode)) {
+      // Convert deleted records to objects.
+      foreach ($results->deletedRecords as $index => $result) {
+        $results->deletedRecords[$index] = (object) $result;
+      }
 
       // Handle merges from Salesforce.
       $merge_fields = array(
@@ -585,7 +596,12 @@ function salesforce_pull_get_deleted_records() {
 
       // Write items to the queue.
       foreach ($results->deletedRecords as $result) {
-        $queue_item = array('delete' => $result);
+        // Cast to array for consistency.
+        $result = (array) $result;
+        $result['type'] = $type;
+        $queue_item = array(
+          'delete' => $result,
+        );
         $queue->createItem($queue_item);
       }
 
@@ -664,7 +680,7 @@ function salesforce_pull_process_merged_records($sf_object) {
  * Process deleted records from salesforce.
  */
 function salesforce_pull_process_deleted_records($sf_object) {
-  $mapping_object = salesforce_mapping_object_load_by_sfid($sf_object->id);
+  $mapping_object = salesforce_mapping_object_load_by_sfid($sf_object['id']);
 
   // Load and wrap the Drupal entity linked to the SF object.
   if ($mapping_object) {
@@ -677,7 +693,7 @@ function salesforce_pull_process_deleted_records($sf_object) {
       // Load the mapping that manages these mapped objects.
       $sf_mapping = reset(salesforce_mapping_load_multiple(
         array(
-          'salesforce_object_type' => $sf_object['attributes']['type'],
+          'salesforce_object_type' => $sf_object['type'],
           'drupal_entity_type' => $wrapper->type(),
           'drupal_bundle' => $wrapper->getBundle(),
         )
@@ -704,7 +720,7 @@ function salesforce_pull_process_deleted_records($sf_object) {
           array(
             '%label' => $wrapper->label(),
             '%id' => $mapping_object->entity_id,
-            '%sfid' => $sf_object->id,
+            '%sfid' => $sf_object['id'],
           )
         );
       }
